@@ -1,0 +1,113 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <fstream>
+#include <chrono>
+
+struct ObjectConfig {
+    std::string name;
+    cv::Scalar hls_min;
+    cv::Scalar hls_max;
+    float w_real;
+    cv::Scalar color;
+};
+
+int main() {
+    cv::FileStorage fs("yaml/kalibrasi.yaml", cv::FileStorage::READ);
+    if (!fs.isOpened()) return -1;
+
+    cv::Mat cameraMatrix;
+    fs["camera_matrix"] >> cameraMatrix;
+    fs.release();
+
+    double fx = cameraMatrix.at<double>(0, 0);
+    double fy = cameraMatrix.at<double>(1, 1);
+    double cx = cameraMatrix.at<double>(0, 2);
+    double cy = cameraMatrix.at<double>(1, 2);
+
+    cv::VideoCapture cap("http://192.168.1.x:4747/video");
+    if (!cap.isOpened()) cap.open(0);
+    if (!cap.isOpened()) return -1;
+
+    std::vector<ObjectConfig> objects = {
+        {"Botol Biru", cv::Scalar(100, 50, 50), cv::Scalar(130, 255, 255), 5.0f, cv::Scalar(255, 0, 0)},
+        {"Kotak Merah", cv::Scalar(0, 50, 50), cv::Scalar(10, 255, 255), 6.0f, cv::Scalar(0, 0, 255)},
+        {"Benda Kuning", cv::Scalar(20, 50, 50), cv::Scalar(35, 255, 255), 4.0f, cv::Scalar(0, 255, 255)}
+    };
+
+    cv::Mat frame, hls, mask;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    int frame_count = 0;
+    double fps = 0.0;
+
+    std::ofstream log_file("docs/koordinat_log.txt", std::ios::app);
+
+    while (true) {
+        cap >> frame;
+        if (frame.empty()) break;
+
+        auto current_time = std::chrono::high_resolution_clock::now();
+        frame_count++;
+        std::chrono::duration<double> elapsed = current_time - start_time;
+        if (elapsed.count() >= 1.0) {
+            fps = frame_count / elapsed.count();
+            frame_count = 0;
+            start_time = current_time;
+        }
+
+        cv::cvtColor(frame, hls, cv::COLOR_BGR2HLS);
+
+        for (const auto& obj : objects) {
+            cv::inRange(hls, obj.hls_min, obj.hls_max, mask);
+
+            cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+            cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+            cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+            std::vector<std::vector<cv::Point>> contours;
+            cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+            double max_area = 0;
+            int largest_idx = -1;
+            for (size_t i = 0; i < contours.size(); i++) {
+                double area = cv::contourArea(contours[i]);
+                if (area > max_area && area > 500) {
+                    max_area = area;
+                    largest_idx = i;
+                }
+            }
+
+            if (largest_idx != -1) {
+                cv::Rect bbox = cv::boundingRect(contours[largest_idx]);
+                float w_pixel = (float)bbox.width;
+
+                float Z = (float)((fx * obj.w_real) / w_pixel);
+                float X = (float)(((bbox.x + bbox.width / 2.0 - cx) * Z) / fx);
+                float Y = (float)(((bbox.y + bbox.height / 2.0 - cy) * Z) / fy);
+
+                cv::rectangle(frame, bbox, obj.color, 2);
+
+                std::string label = obj.name + " | Z: " + std::to_string((int)Z) + "cm";
+                cv::putText(frame, label, cv::Point(bbox.x, bbox.y - 10), cv::FONT_HERSHEY_SIMPLEX, 0.5, obj.color, 2);
+
+                std::string coord_str = "X:" + std::to_string((int)X) + " Y:" + std::to_string((int)Y) + " Z:" + std::to_string((int)Z);
+                cv::putText(frame, coord_str, cv::Point(bbox.x, bbox.y + bbox.height + 20), cv::FONT_HERSHEY_SIMPLEX, 0.4, obj.color, 1);
+            }
+        }
+
+        cv::putText(frame, "FPS: " + std::to_string((int)fps), cv::Point(20, 40), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+        cv::imshow("3D Tracker HUD", frame);
+
+        char key = (char)cv::waitKey(1);
+        if (key == 's') {
+            cv::imwrite("docs/objek_detect.png", frame);
+            log_file << "Screenshot saved\n";
+        } else if (key == 'q') {
+            break;
+        }
+    }
+
+    log_file.close();
+    cap.release();
+    cv::destroyAllWindows();
+    return 0;
+}
